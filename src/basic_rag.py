@@ -1,23 +1,30 @@
-"""基础 RAG 系统实现"""
+"""基础 RAG 系统实现 - 基于 LangGraph Agent"""
 from typing import Dict, Any, List
 
-from langchain_classic.chains.retrieval_qa.base import RetrievalQA
-from langchain_core.prompts import ChatPromptTemplate
+from langchain.agents import create_agent
+from langchain_core.tools import create_retriever_tool
+from langchain_core.messages import AIMessage, ToolMessage, HumanMessage
+from langchain_core.documents import Document
 from loguru import logger
 
 from langchain_openai import ChatOpenAI
-from langchain_core.documents import Document
 
 from src.config import config
-from src.vector_store import VectorStoreManager
+
+SYSTEM_PROMPT = """你是一位专业的药典顾问，请使用检索工具查询药典内容来回答用户问题。
+
+要求：
+1. 必须先使用检索工具查询相关药典内容，再基于检索结果回答
+2. 严格基于检索到的药典内容回答
+3. 如果药典中没有明确说明，请说明"药典内容未明确规定"
+4. 如果适用，请引用具体药典内容"""
 
 
 class BasicRAGSystem:
-    """基础 RAG 系统"""
+    """基础 RAG 系统 - 基于 Agent"""
 
     def __init__(self):
         """初始化 RAG 系统"""
-        # 初始化 LLM
         if not config.is_openai_configured:
             raise ValueError("请设置 OPENAI_API_KEY 环境变量")
 
@@ -29,49 +36,32 @@ class BasicRAGSystem:
             base_url=config.openai_api_base
         )
 
-        # 初始化向量存储
         self.vs_manager = VectorStoreManager()
         self.vector_store = self.vs_manager.load_vector_store()
 
-        # 创建检索器
         self.retriever = self.vector_store.as_retriever(
             search_type="similarity",
             search_kwargs={"k": config.retriever_k}
         )
 
-        # 创建提示模板
-        self.prompt = self._create_prompt_template()
+        self.retriever_tool = self._create_retriever_tool()
+        self.agent = self._create_agent()
 
-        # 创建 QA 链
-        self.qa_chain = self._create_qa_chain()
-
-    def _create_prompt_template(self) -> ChatPromptTemplate:
-        """创建提示模板"""
-        return ChatPromptTemplate.from_template("""
-你是一位专业的药典顾问，基于以下药典内容回答用户问题。
-
-相关药典内容：
-{context}
-
-用户问题：{question}
-
-要求：
-1. 严格基于提供的药典内容回答
-2. 如果药典中没有明确说明，请说明"药典内容未明确规定"
-3. 如果适用，请引用具体药典内容
-
-回答：
-""")
-
-    def _create_qa_chain(self) -> RetrievalQA:
-        """创建 QA 链"""
-        return RetrievalQA.from_chain_type(
-            llm=self.llm,
-            chain_type="stuff",
+    def _create_retriever_tool(self):
+        """创建检索工具"""
+        return create_retriever_tool(
             retriever=self.retriever,
-            chain_type_kwargs={"prompt": self.prompt},
-            return_source_documents=True,
-            verbose=False
+            name="pharmacopoeia_search",
+            description="搜索中国药典相关内容。当用户询问药典相关的任何问题时，使用此工具检索相关内容。",
+            response_format="content_and_artifact",
+        )
+
+    def _create_agent(self):
+        """创建智能体"""
+        return create_agent(
+            model=self.llm,
+            tools=[self.retriever_tool],
+            system_prompt=SYSTEM_PROMPT,
         )
 
     def ask(self, question: str) -> Dict[str, Any]:
@@ -79,16 +69,33 @@ class BasicRAGSystem:
         logger.debug(f"用户问题: {question}")
 
         try:
-            result = self.qa_chain.invoke({"query": question})
+            result = self.agent.invoke(
+                {"messages": [HumanMessage(content=question)]}
+            )
+
+            answer = ""
+            source_documents: List[Document] = []
+
+            for msg in result["messages"]:
+                if isinstance(msg, AIMessage) and msg.content and not msg.tool_calls:
+                    answer = msg.content if isinstance(msg.content, str) else str(msg.content)
+                elif isinstance(msg, ToolMessage) and msg.artifact:
+                    source_documents = msg.artifact
+
+            if not answer:
+                for msg in reversed(result["messages"]):
+                    if isinstance(msg, AIMessage) and msg.content:
+                        answer = msg.content if isinstance(msg.content, str) else str(msg.content)
+                        break
 
             response = {
                 "question": question,
-                "answer": result["result"],
-                "source_documents": result["source_documents"],
+                "answer": answer,
+                "source_documents": source_documents,
                 "success": True
             }
 
-            logger.success(f"回答生成成功，长度: {len(result['result'])}")
+            logger.success(f"回答生成成功，长度: {len(answer)}")
             return response
 
         except Exception as e:
