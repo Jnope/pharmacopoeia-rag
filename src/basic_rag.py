@@ -149,20 +149,14 @@ class BasicRAGSystem:
             按 time倒序 的会话列表，每项含 thread_id, message_count, first_message
         """
         try:
-            cursor = self._sqlite_conn.cursor()
-            cursor.execute('''
-                SELECT c.thread_id, c.metadata
-                FROM checkpoints c
-                INNER JOIN (
-                    SELECT thread_id, MAX(rowid) AS max_rowid
-                    FROM checkpoints
-                    GROUP BY thread_id
-                ) latest ON c.rowid = latest.max_rowid
-                ORDER BY c.rowid DESC
-            ''')
+            all_tuples = list(self._checkpointer.list(None, limit=1000))
+            seen = set()
             sessions = []
-            for row in cursor.fetchall():
-                thread_id = row[0]
+            for t in all_tuples:
+                thread_id = t.config["configurable"]["thread_id"]
+                if thread_id in seen:
+                    continue
+                seen.add(thread_id)
                 history = self.get_session_history(thread_id)
                 first_user_msg = ""
                 for h in history:
