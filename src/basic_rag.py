@@ -1,15 +1,18 @@
 """基础 RAG 系统实现 - 基于 LangGraph Agent"""
-from typing import Dict, Any, List
+import sqlite3
+from typing import Dict, Any, List, Optional
 
 from langchain.agents import create_agent
 from langchain_core.tools import create_retriever_tool
 from langchain_core.messages import AIMessage, ToolMessage, HumanMessage
 from langchain_core.documents import Document
+from langgraph.checkpoint.sqlite import SqliteSaver
 from loguru import logger
 
 from langchain_openai import ChatOpenAI
 
 from src.config import config
+from src.vector_store import VectorStoreManager
 
 SYSTEM_PROMPT = """你是一位专业的药典顾问，请使用检索工具查询药典内容来回答用户问题。
 
@@ -21,7 +24,7 @@ SYSTEM_PROMPT = """你是一位专业的药典顾问，请使用检索工具查�
 
 
 class BasicRAGSystem:
-    """基础 RAG 系统 - 基于 Agent"""
+    """基础 RAG 系统 - 基于 Agent，支持 SQLite 会话持久化"""
 
     def __init__(self):
         """初始化 RAG 系统"""
@@ -45,6 +48,9 @@ class BasicRAGSystem:
         )
 
         self.retriever_tool = self._create_retriever_tool()
+
+        self._sqlite_conn = sqlite3.connect(str(config.checkpoint_db_path), check_same_thread=False)
+        self._checkpointer = SqliteSaver(self._sqlite_conn)
         self.agent = self._create_agent()
 
     def _create_retriever_tool(self):
@@ -62,15 +68,27 @@ class BasicRAGSystem:
             model=self.llm,
             tools=[self.retriever_tool],
             system_prompt=SYSTEM_PROMPT,
+            checkpointer=self._checkpointer,
         )
 
-    def ask(self, question: str) -> Dict[str, Any]:
-        """提问并获取回答"""
-        logger.debug(f"用户问题: {question}")
+    def ask(self, question: str, thread_id: Optional[str] = None) -> Dict[str, Any]:
+        """提问并获取回答
+
+        Args:
+            question: 用户问题
+            thread_id: 会话ID，相同 thread_id 下保留历史对话上下文。
+                       为 None 时不保留历史（无状态调用）。
+        """
+        logger.debug(f"用户问题: {question}, 会话: {thread_id}")
 
         try:
+            config_kwargs = {}
+            if thread_id:
+                config_kwargs["configurable"] = {"thread_id": thread_id}
+
             result = self.agent.invoke(
-                {"messages": [HumanMessage(content=question)]}
+                {"messages": [HumanMessage(content=question)]},
+                config=config_kwargs or None,
             )
 
             answer = ""
@@ -107,7 +125,89 @@ class BasicRAGSystem:
                 "success": False
             }
 
-    def ask_with_context(self, question: str) -> None:
+    def get_session_history(self, thread_id: str) -> List[Dict[str, str]]:
+        """获取指定会话的历史消息摘要"""
+        try:
+            state = self.agent.get_state(
+                config={"configurable": {"thread_id": thread_id}}
+            )
+            history = []
+            for msg in state.values.get("messages", []):
+                if isinstance(msg, HumanMessage):
+                    history.append({"role": "user", "content": msg.content})
+                elif isinstance(msg, AIMessage) and msg.content and not msg.tool_calls:
+                    history.append({"role": "assistant", "content": msg.content})
+            return history
+        except Exception as e:
+            logger.warning(f"获取会话历史失败: {e}")
+            return []
+
+    def list_sessions(self) -> List[Dict[str, Any]]:
+        """列出所有会话及其最新信息
+
+        Returns:
+            按 time倒序 的会话列表，每项含 thread_id, message_count, first_message
+        """
+        try:
+            cursor = self._sqlite_conn.cursor()
+            cursor.execute('''
+                SELECT c.thread_id, c.metadata
+                FROM checkpoints c
+                INNER JOIN (
+                    SELECT thread_id, MAX(rowid) AS max_rowid
+                    FROM checkpoints
+                    GROUP BY thread_id
+                ) latest ON c.rowid = latest.max_rowid
+                ORDER BY c.rowid DESC
+            ''')
+            sessions = []
+            for row in cursor.fetchall():
+                thread_id = row[0]
+                history = self.get_session_history(thread_id)
+                first_user_msg = ""
+                for h in history:
+                    if h["role"] == "user":
+                        first_user_msg = h["content"][:50]
+                        break
+                sessions.append({
+                    "thread_id": thread_id,
+                    "message_count": len(history),
+                    "first_message": first_user_msg,
+                })
+            return sessions
+        except Exception as e:
+            logger.warning(f"列出会话失败: {e}")
+            return []
+
+    def load_session_messages(self, thread_id: str) -> List[Dict[str, str]]:
+        """加载指定会话的聊天记录（用于恢复 UI 显示）
+
+        Returns:
+            消息列表，每项含 role 和 content
+        """
+        return self.get_session_history(thread_id)
+
+    def reset_session(self, thread_id: str) -> None:
+        """重置指定会话（删除所有历史，保留 thread_id）"""
+        try:
+            self._checkpointer.delete_thread(thread_id)
+            logger.info(f"会话 {thread_id} 已重置")
+        except Exception as e:
+            logger.warning(f"重置会话失败: {e}")
+
+    def delete_session(self, thread_id: str) -> None:
+        """删除指定会话（从 SQLite 中彻底移除）"""
+        try:
+            self._checkpointer.delete_thread(thread_id)
+            logger.info(f"会话 {thread_id} 已删除")
+        except Exception as e:
+            logger.warning(f"删除会话失败: {e}")
+
+    def close(self):
+        """关闭数据库连接"""
+        self._sqlite_conn.close()
+
+    def ask_with_context(self, question: str, thread_id: Optional[str] = None) -> None:
         """提问并打印详细信息"""
         result = self.ask(question)
 

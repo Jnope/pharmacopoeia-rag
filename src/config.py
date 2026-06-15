@@ -49,6 +49,9 @@ class Config:
     vector_store_path: Path = VECTOR_STORE_DIR
     collection_name: str = os.getenv("COLLECTION_NAME", "pharma_collection")
 
+    # 会话持久化配置
+    checkpoint_db_path: Path = ROOT_DIR / "chat_history.db"
+
     @property
     def is_openai_configured(self) -> bool:
         """检查 OpenAI 是否已配置"""
